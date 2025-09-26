@@ -1,0 +1,13 @@
+name: wxtmysql
+description: "A new Flutter package project."
+version: 0.0.1
+homepage:
+
+environment:
+  sdk: ^3.0.0
+  flutter: ">=1.17.0"
+
+dependencies:
+  mysql1: ^0.20.0
+  logging: ^1.2.0
+  dotenv: ^4.0.1
