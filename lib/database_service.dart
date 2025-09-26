@@ -5,6 +5,7 @@ import 'package:logging/logging.dart';
 import 'package:mysql1/mysql1.dart';
 import 'package:synchronized/synchronized.dart';
 import 'connection_pool.dart';
+import 'database_init_config.dart';
 import 'env_keys.dart';
 
 /// 数据库事务处理类
@@ -146,10 +147,35 @@ class DatabaseService {
   }
 
   /// 初始化连接池
-  Future<void> initialize() async {
+  /// [ensureDatabase] 是否确保数据库存在，如果不存在则创建
+  /// [charset] 创建数据库时使用的字符集，默认 utf8mb4
+  /// [collate] 创建数据库时使用的排序规则，默认 utf8mb4_unicode_ci
+  Future<void> initialize({
+    bool ensureDatabase = true,
+    String charset = 'utf8mb4',
+    String collate = 'utf8mb4_unicode_ci',
+  }) async {
+    return initializeWithConfig(DatabaseInitConfig(
+      ensureDatabase: ensureDatabase,
+      charset: charset,
+      collate: collate,
+    ));
+  }
+
+  /// 使用配置对象初始化连接池
+  Future<void> initializeWithConfig(DatabaseInitConfig config) async {
     if (_connectionPool != null) {
       _logger.info('Connection pool already initialized');
       return;
+    }
+
+    if (config.verboseLogging) {
+      _logger.info('Initializing DatabaseService with config: $config');
+    }
+
+    // 如果需要确保数据库存在，先检查和创建
+    if (config.ensureDatabase) {
+      await _ensureDatabaseExists(config.charset, config.collate);
     }
 
     final settings = ConnectionSettings(
@@ -160,11 +186,18 @@ class DatabaseService {
       db: _database,
     );
 
-    final config = _poolConfig ?? const ConnectionPoolConfig();
-    _connectionPool = ConnectionPool(settings, config);
+    final poolConfig = _poolConfig ?? const ConnectionPoolConfig();
+    _connectionPool = ConnectionPool(settings, poolConfig);
     
     await _connectionPool!.initialize();
-    _logger.info('DatabaseService initialized with connection pool');
+    
+    if (config.verboseLogging) {
+      _logger.info('DatabaseService initialized successfully with connection pool');
+      final dbInfo = await getDatabaseInfo();
+      _logger.info('Database info: $dbInfo');
+    } else {
+      _logger.info('DatabaseService initialized with connection pool');
+    }
   }
 
   /// 确保连接池已初始化
@@ -173,6 +206,64 @@ class DatabaseService {
       await initialize();
     }
     return _connectionPool!;
+  }
+
+  /// 确保目标数据库存在，如果不存在则创建
+  Future<void> _ensureDatabaseExists(String charset, String collate) async {
+    MySqlConnection? adminConnection;
+    
+    try {
+      _logger.info('Checking if database "$_database" exists...');
+      
+      // 创建不指定数据库的管理连接
+      final adminSettings = ConnectionSettings(
+        host: _host,
+        port: _port,
+        user: _username,
+        password: _password,
+        // 不指定 db，连接到 MySQL 服务器
+      );
+
+      adminConnection = await MySqlConnection.connect(adminSettings)
+          .timeout(Duration(seconds: 30));
+
+      // 检查数据库是否存在
+      final result = await adminConnection.query(
+        'SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?',
+        [_database]
+      );
+
+      if (result.isEmpty) {
+        _logger.info('Database "$_database" does not exist, creating...');
+        
+        // 创建数据库
+        await adminConnection.query(
+          'CREATE DATABASE `$_database` CHARACTER SET $charset COLLATE $collate'
+        );
+        
+        _logger.info('Database "$_database" created successfully with charset: $charset, collate: $collate');
+      } else {
+        _logger.info('Database "$_database" already exists');
+      }
+
+    } catch (e) {
+      _logger.severe('Failed to ensure database exists: $e');
+      // 根据错误类型决定是否重新抛出异常
+      if (e.toString().contains('Access denied') || 
+          e.toString().contains('Unknown database')) {
+        _logger.warning('Database creation failed, but will attempt to connect anyway: $e');
+        // 不重新抛出，让后续的连接尝试处理
+      } else {
+        rethrow;
+      }
+    } finally {
+      // 关闭管理连接
+      try {
+        await adminConnection?.close();
+      } catch (e) {
+        _logger.warning('Error closing admin connection: $e');
+      }
+    }
   }
 
 
@@ -341,5 +432,140 @@ class DatabaseService {
       'host': '$_host:$_port',
       'active_transactions': _connectionTransactions.length,
     };
+  }
+
+  /// 检查数据库是否存在
+  Future<bool> databaseExists() async {
+    try {
+      // 尝试连接到目标数据库
+      final testSettings = ConnectionSettings(
+        host: _host,
+        port: _port,
+        user: _username,
+        password: _password,
+        db: _database,
+      );
+
+      final testConnection = await MySqlConnection.connect(testSettings)
+          .timeout(Duration(seconds: 10));
+      
+      await testConnection.close();
+      return true;
+    } catch (e) {
+      if (e.toString().contains('Unknown database')) {
+        return false;
+      }
+      // 其他错误也认为数据库不存在或不可访问
+      _logger.warning('Error checking database existence: $e');
+      return false;
+    }
+  }
+
+  /// 创建数据库（需要管理员权限）
+  Future<void> createDatabase({
+    String charset = 'utf8mb4',
+    String collate = 'utf8mb4_unicode_ci',
+    bool ifNotExists = true,
+  }) async {
+    MySqlConnection? adminConnection;
+    
+    try {
+      _logger.info('Creating database "$_database"...');
+      
+      final adminSettings = ConnectionSettings(
+        host: _host,
+        port: _port,
+        user: _username,
+        password: _password,
+      );
+
+      adminConnection = await MySqlConnection.connect(adminSettings)
+          .timeout(Duration(seconds: 30));
+
+      final ifNotExistsClause = ifNotExists ? 'IF NOT EXISTS' : '';
+      await adminConnection.query(
+        'CREATE DATABASE $ifNotExistsClause `$_database` CHARACTER SET $charset COLLATE $collate'
+      );
+      
+      _logger.info('Database "$_database" created successfully');
+      
+    } catch (e) {
+      _logger.severe('Failed to create database: $e');
+      rethrow;
+    } finally {
+      await adminConnection?.close();
+    }
+  }
+
+  /// 删除数据库（危险操作，需要管理员权限）
+  Future<void> dropDatabase({bool ifExists = true}) async {
+    MySqlConnection? adminConnection;
+    
+    try {
+      _logger.warning('Dropping database "$_database"...');
+      
+      final adminSettings = ConnectionSettings(
+        host: _host,
+        port: _port,
+        user: _username,
+        password: _password,
+      );
+
+      adminConnection = await MySqlConnection.connect(adminSettings)
+          .timeout(Duration(seconds: 30));
+
+      final ifExistsClause = ifExists ? 'IF EXISTS' : '';
+      await adminConnection.query('DROP DATABASE $ifExistsClause `$_database`');
+      
+      _logger.warning('Database "$_database" dropped successfully');
+      
+      // 如果连接池已初始化，需要关闭它
+      if (_connectionPool != null) {
+        await close();
+      }
+      
+    } catch (e) {
+      _logger.severe('Failed to drop database: $e');
+      rethrow;
+    } finally {
+      await adminConnection?.close();
+    }
+  }
+
+  /// 获取数据库信息
+  Future<Map<String, dynamic>> getDatabaseInfo() async {
+    try {
+      final charsetResult = await query(
+        'SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME '
+        'FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = ?',
+        [_database]
+      );
+
+      final tablesResult = await query(
+        'SELECT COUNT(*) as table_count FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ?',
+        [_database]
+      );
+
+      final sizeResult = await query(
+        'SELECT ROUND(SUM(data_length + index_length) / 1024 / 1024, 2) AS size_mb '
+        'FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_SCHEMA = ?',
+        [_database]
+      );
+
+      return {
+        'database_name': _database,
+        'charset': charsetResult.isNotEmpty ? charsetResult.first['DEFAULT_CHARACTER_SET_NAME'] : 'unknown',
+        'collation': charsetResult.isNotEmpty ? charsetResult.first['DEFAULT_COLLATION_NAME'] : 'unknown',
+        'table_count': tablesResult.isNotEmpty ? tablesResult.first['table_count'] : 0,
+        'size_mb': sizeResult.isNotEmpty ? (sizeResult.first['size_mb'] ?? 0) : 0,
+        'host': '$_host:$_port',
+      };
+    } catch (e) {
+      _logger.warning('Failed to get database info: $e');
+      return {
+        'database_name': _database,
+        'error': e.toString(),
+      };
+    }
   }
 }
