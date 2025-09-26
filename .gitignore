@@ -29,3 +29,5 @@ migrate_working_dir/
 .flutter-plugins
 .flutter-plugins-dependencies
 build/
+concurrent_safety_demo.dart
+CONCURRENT_SAFETY_FIX.md

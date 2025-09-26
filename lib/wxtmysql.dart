@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:dotenv/dotenv.dart' as dotenv;
 import 'package:logging/logging.dart';
 import 'package:mysql1/mysql1.dart';
+import 'package:synchronized/synchronized.dart';
 import 'env_keys.dart';
 
 
@@ -18,6 +19,12 @@ class DatabaseService {
 
   final Logger _logger = Logger('DatabaseService');
   MySqlConnection? _connection;
+  
+  // 并发控制
+  final Lock _connectionLock = Lock();
+  final Lock _transactionLock = Lock();
+  bool _isConnecting = false;
+  bool _inTransaction = false;
 
   // 数据库配置
   late final String _host;
@@ -29,6 +36,15 @@ class DatabaseService {
   MySqlConnection? get connection => _connection;
 
   String get databaseName => _database;
+  
+  /// 检查是否已连接
+  bool get isConnected => _connection != null;
+  
+  /// 检查是否在事务中
+  bool get inTransaction => _inTransaction;
+  
+  /// 检查是否正在连接
+  bool get isConnecting => _isConnecting;
 
   /// 初始化数据库配置
   void _initializeConfig() {
@@ -57,34 +73,60 @@ class DatabaseService {
 
   /// 连接到数据库
   Future<MySqlConnection> connect() async {
-  if (_connection != null) {
-    try {
-    // 测试现有连接
-    await _connection!.query('SELECT 1');
-    return _connection!;
-    } catch (e) {
-    _logger.warning('Existing connection failed, reconnecting: $e');
-    await _connection?.close();
-    _connection = null;
+    return await _connectionLock.synchronized(() async {
+      // 如果正在连接中，等待连接完成
+      if (_isConnecting) {
+        while (_isConnecting) {
+          await Future.delayed(Duration(milliseconds: 50));
+        }
+        if (_connection != null) return _connection!;
+      }
+
+      if (_connection != null) {
+        try {
+          // 测试现有连接
+          await _connection!.query('SELECT 1');
+          return _connection!;
+        } catch (e) {
+          _logger.warning('Existing connection failed, reconnecting: $e');
+          await _closeConnection();
+        }
+      }
+
+      _isConnecting = true;
+      try {
+        final settings = ConnectionSettings(
+          host: _host,
+          port: _port,
+          user: _username,
+          password: _password,
+          db: _database,
+        );
+
+        _connection = await MySqlConnection.connect(settings);
+        _logger.info('Successfully connected to MySQL database');
+        return _connection!;
+      } catch (e) {
+        _logger.severe('Failed to connect to database: $e');
+        rethrow;
+      } finally {
+        _isConnecting = false;
+      }
+    });
+  }
+
+  /// 安全关闭连接的私有方法
+  Future<void> _closeConnection() async {
+    if (_connection != null) {
+      try {
+        await _connection!.close();
+      } catch (e) {
+        _logger.warning('Error closing connection: $e');
+      } finally {
+        _connection = null;
+        _inTransaction = false;
+      }
     }
-  }
-
-  try {
-    final settings = ConnectionSettings(
-    host: _host,
-    port: _port,
-    user: _username,
-    password: _password,
-    db: _database,
-    );
-
-    _connection = await MySqlConnection.connect(settings);
-    _logger.info('Successfully connected to MySQL database');
-    return _connection!;
-  } catch (e) {
-    _logger.severe('Failed to connect to database: $e');
-    rethrow;
-  }
   }
 
   /// 执行查询
@@ -140,36 +182,64 @@ class DatabaseService {
 
   /// 开始事务
   Future<void> startTransaction() async {
-  final conn = await connect();
-  await conn.query('START TRANSACTION');
-  _logger.fine('Transaction started');
+    return await _transactionLock.synchronized(() async {
+      if (_inTransaction) {
+        throw StateError('Transaction already in progress');
+      }
+      final conn = await connect();
+      await conn.query('START TRANSACTION');
+      _inTransaction = true;
+      _logger.fine('Transaction started');
+    });
   }
 
   /// 提交事务
   Future<void> commit() async {
-  final conn = await connect();
-  await conn.query('COMMIT');
-  _logger.fine('Transaction committed');
+    return await _transactionLock.synchronized(() async {
+      if (!_inTransaction) {
+        throw StateError('No transaction in progress');
+      }
+      final conn = await connect();
+      await conn.query('COMMIT');
+      _inTransaction = false;
+      _logger.fine('Transaction committed');
+    });
   }
 
   /// 回滚事务
   Future<void> rollback() async {
-  final conn = await connect();
-  await conn.query('ROLLBACK');
-  _logger.fine('Transaction rolled back');
+    return await _transactionLock.synchronized(() async {
+      if (!_inTransaction) {
+        throw StateError('No transaction in progress');
+      }
+      final conn = await connect();
+      await conn.query('ROLLBACK');
+      _inTransaction = false;
+      _logger.fine('Transaction rolled back');
+    });
   }
 
   /// 执行事务
   Future<T> transaction<T>(Future<T> Function() operation) async {
-  await startTransaction();
-  try {
-    final result = await operation();
-    await commit();
-    return result;
-  } catch (e) {
-    await rollback();
-    rethrow;
-  }
+    return await _transactionLock.synchronized(() async {
+      if (_inTransaction) {
+        throw StateError('Nested transactions are not supported');
+      }
+      
+      await startTransaction();
+      try {
+        final result = await operation();
+        await commit();
+        return result;
+      } catch (e) {
+        try {
+          await rollback();
+        } catch (rollbackError) {
+          _logger.severe('Failed to rollback transaction: $rollbackError');
+        }
+        rethrow;
+      }
+    });
   }
 
   /// 测试数据库连接
@@ -186,11 +256,19 @@ class DatabaseService {
 
   /// 关闭连接
   Future<void> close() async {
-  if (_connection != null) {
-    await _connection!.close();
-    _connection = null;
-    _logger.info('Database connection closed');
-  }
+    return await _connectionLock.synchronized(() async {
+      if (_inTransaction) {
+        _logger.warning('Closing connection while transaction is active, rolling back');
+        try {
+          await rollback();
+        } catch (e) {
+          _logger.severe('Failed to rollback transaction during close: $e');
+        }
+      }
+      
+      await _closeConnection();
+      _logger.info('Database connection closed');
+    });
   }
 
   /// 获取数据库版本信息
