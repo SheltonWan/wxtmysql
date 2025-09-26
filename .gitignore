@@ -31,3 +31,6 @@ migrate_working_dir/
 build/
 concurrent_safety_demo.dart
 CONCURRENT_SAFETY_FIX.md
+ERROR_FIXES.md
+HIGH_CONCURRENCY_UPGRADE.md
+OPTIMIZATION_SUMMARY.md
