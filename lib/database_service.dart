@@ -1,5 +1,3 @@
-import 'dart:io';
-
 import 'package:dotenv/dotenv.dart' as dotenv;
 import 'package:logging/logging.dart';
 import 'package:mysql1/mysql1.dart';
@@ -128,20 +126,11 @@ class DatabaseService {
   void _initializeConfig() {
     final env = dotenv.DotEnv(includePlatformEnvironment: true)..load(); // 加载.env文件
 
-    _host = env[EnvKeys.dbHost] ?? Platform.environment[EnvKeys.dbHost] ?? 'localhost';
-    _port = int.tryParse(env[EnvKeys.dbPort] ??
-            Platform.environment[EnvKeys.dbPort] ??
-            '3306') ??
-        3306;
-    _database = env[EnvKeys.dbName] ??
-        Platform.environment[EnvKeys.dbName] ??
-        'auth_db';
-    _username = env[EnvKeys.dbUser] ??
-        Platform.environment[EnvKeys.dbUser] ??
-        'db_user';
-    _password = env[EnvKeys.dbPassword] ??
-        Platform.environment[EnvKeys.dbPassword] ??
-        'db_password';
+    _host = env[EnvKeys.dbHost] ?? 'localhost';
+    _port = int.tryParse(env[EnvKeys.dbPort] ?? '3306') ?? 3306;
+    _database = env[EnvKeys.dbName] ?? 'auth_db';
+    _username = env[EnvKeys.dbUser] ?? 'db_user';
+    _password = env[EnvKeys.dbPassword] ?? 'db_password';
 
     _logger.info('Database config: $_host:$_port/$_database');
   }
