@@ -1,0 +1,49 @@
+#!/bin/sh
+# Pre-commit hook: 自动递增 pubspec.yaml 的 patch 版本
+# 要求：安装了 Dart/Flutter SDK，并且 tool/bump_version.dart 存在
+
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+PUBSPEC="pubspec.yaml"
+BUMP_SCRIPT="tool/bump_version.dart"
+
+# 若没有 Dart 命令，跳过（不中断提交）。你也可以改为失败退出。
+if ! command -v dart >/dev/null 2>&1; then
+  echo "[pre-commit] 未检测到 dart 命令，跳过版本递增。"
+  exit 0
+fi
+
+# 如果脚本不存在，跳过
+if [ ! -f "$BUMP_SCRIPT" ]; then
+  echo "[pre-commit] 未找到 $BUMP_SCRIPT，跳过版本递增。"
+  exit 0
+fi
+
+# 若本次提交已经修改了 pubspec.yaml，避免冲突，跳过自动递增
+if git diff --cached --name-only | grep -q "^$PUBSPEC$"; then
+  echo "[pre-commit] pubspec.yaml 已在暂存区，跳过自动递增。"
+  exit 0
+fi
+
+# 执行版本递增
+set +e
+DART_OUTPUT=$(dart "$BUMP_SCRIPT" --pubspec "$PUBSPEC" 2>&1)
+DART_EXIT=$?
+set -e
+
+if [ $DART_EXIT -ne 0 ]; then
+  echo "[pre-commit] 版本递增失败："
+  echo "$DART_OUTPUT"
+  exit 1
+fi
+
+# 将变更加入当前提交
+if git ls-files --error-unmatch "$PUBSPEC" >/dev/null 2>&1; then
+  git add "$PUBSPEC"
+fi
+
+echo "[pre-commit] 完成：$DART_OUTPUT"
+exit 0
