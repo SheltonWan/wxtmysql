@@ -8,22 +8,22 @@ import 'package:synchronized/synchronized.dart';
 class ConnectionPoolConfig {
   /// 最小连接数
   final int minConnections;
-  
+
   /// 最大连接数
   final int maxConnections;
-  
+
   /// 连接超时时间（毫秒）
   final int connectionTimeout;
-  
+
   /// 连接最大空闲时间（毫秒）
   final int maxIdleTime;
-  
+
   /// 连接验证查询
   final String validationQuery;
-  
+
   /// 连接验证间隔（毫秒）
   final int validationInterval;
-  
+
   /// 获取连接最大等待时间（毫秒）
   final int maxWaitTime;
 
@@ -145,11 +145,11 @@ class ConnectionPool {
   final ConnectionSettings _settings;
   final ConnectionPoolConfig _config;
   final Logger _logger = Logger('ConnectionPool');
-  
+
   final List<PooledConnection> _connections = [];
   final Queue<Completer<PooledConnection>> _waitingQueue = Queue();
   final Lock _poolLock = Lock();
-  
+
   Timer? _maintenanceTimer;
   bool _isClosing = false;
   bool _initialized = false;
@@ -214,7 +214,7 @@ class ConnectionPool {
           final newConnection = await _createConnection();
           _connections.add(newConnection);
           newConnection.markInUse();
-          _logger.fine('Created new connection (${_connections.length}/${_config.maxConnections})');
+          _logger.info('Created new connection (${_connections.length}/${_config.maxConnections})');
           return newConnection;
         } catch (e) {
           _logger.severe('Failed to create new connection: $e');
@@ -223,7 +223,7 @@ class ConnectionPool {
       }
 
       // 所有连接都在使用中，需要等待
-      _logger.fine('All connections in use, waiting...');
+      _logger.severe('All connections in use, waiting...');
       return _waitForConnection();
     });
   }
@@ -240,7 +240,7 @@ class ConnectionPool {
           final waiter = _waitingQueue.removeFirst();
           pooledConnection.markInUse();
           waiter.complete(pooledConnection);
-          _logger.fine('Connection assigned to waiting request');
+          _logger.info('Connection assigned to waiting request');
         }
       }
     });
@@ -381,7 +381,7 @@ class ConnectionPool {
         }
       }
 
-      _logger.fine('Maintenance completed: ${getStats()}');
+      _logger.info('Maintenance completed: ${getStats()}');
     });
   }
 
