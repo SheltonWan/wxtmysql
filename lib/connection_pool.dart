@@ -29,7 +29,7 @@ class ConnectionPoolConfig {
 
   const ConnectionPoolConfig({
     this.minConnections = 2,
-    this.maxConnections = 10,
+    this.maxConnections = 20,
     this.connectionTimeout = 30000, // 30秒
     this.maxIdleTime = 300000, // 5分钟
     this.validationQuery = 'SELECT 1',
