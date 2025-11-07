@@ -27,6 +27,12 @@ class ConnectionPoolConfig {
   /// 获取连接最大等待时间（毫秒）
   final int maxWaitTime;
 
+  /// 等待队列最大长度（防止内存溢出）
+  final int maxWaitingRequests;
+
+  /// 是否启用快速失败模式
+  final bool enableFastFail;
+
   const ConnectionPoolConfig({
     this.minConnections = 2,
     this.maxConnections = 20,
@@ -35,6 +41,8 @@ class ConnectionPoolConfig {
     this.validationQuery = 'SELECT 1',
     this.validationInterval = 60000, // 1分钟
     this.maxWaitTime = 10000, // 10秒
+    this.maxWaitingRequests = 50, // 最大等待队列长度
+    this.enableFastFail = false, // 是否启用快速失败
   });
 
   /// 验证配置参数
@@ -59,6 +67,9 @@ class ConnectionPoolConfig {
     }
     if (maxWaitTime <= 0) {
       throw ArgumentError('maxWaitTime must be > 0');
+    }
+    if (maxWaitingRequests <= 0) {
+      throw ArgumentError('maxWaitingRequests must be > 0');
     }
   }
 }
@@ -116,6 +127,7 @@ class ConnectionPoolStats {
   final int activeConnections;
   final int idleConnections;
   final int waitingRequests;
+  final int invalidConnections;
   final DateTime timestamp;
 
   ConnectionPoolStats({
@@ -123,6 +135,7 @@ class ConnectionPoolStats {
     required this.activeConnections,
     required this.idleConnections,
     required this.waitingRequests,
+    required this.invalidConnections,
   }) : timestamp = DateTime.now();
 
   Map<String, dynamic> toMap() {
@@ -131,6 +144,7 @@ class ConnectionPoolStats {
       'activeConnections': activeConnections,
       'idleConnections': idleConnections,
       'waitingRequests': waitingRequests,
+      'invalidConnections': invalidConnections,
       'timestamp': timestamp.toIso8601String(),
     };
   }
@@ -138,7 +152,7 @@ class ConnectionPoolStats {
   @override
   String toString() {
     return 'ConnectionPool(total: $totalConnections, active: $activeConnections, '
-           'idle: $idleConnections, waiting: $waitingRequests)';
+           'idle: $idleConnections, waiting: $waitingRequests, invalid: $invalidConnections)';
   }
 }
 
@@ -155,6 +169,11 @@ class ConnectionPool {
   Timer? _maintenanceTimer;
   bool _isClosing = false;
   bool _initialized = false;
+
+  // 添加统计计数器
+  int _totalTimeouts = 0;
+  int _totalRequests = 0;
+  DateTime? _lastTimeoutAt;
 
   ConnectionPool(this._settings, [ConnectionPoolConfig? config])
       : _config = config ?? const ConnectionPoolConfig() {
@@ -193,6 +212,8 @@ class ConnectionPool {
 
   /// 获取连接
   Future<PooledConnection> getConnection() async {
+    _totalRequests++; // 统计总请求数
+    
     if (_isClosing) {
       throw StateError('Connection pool is closing');
     }
@@ -224,8 +245,19 @@ class ConnectionPool {
         }
       }
 
+      // 所有连接都在使用中，检查是否启用快速失败
+      if (_config.enableFastFail) {
+        throw StateError('All connections in use, fast-fail enabled. Pool stats: ${getStats()}');
+      }
+
+      // 检查等待队列是否已满
+      if (_waitingQueue.length >= _config.maxWaitingRequests) {
+        throw StateError('Too many waiting requests (${_waitingQueue.length}/${_config.maxWaitingRequests}). '
+                        'Pool stats: ${getStats()}');
+      }
+
       // 所有连接都在使用中，需要等待
-      _logger.severe('All connections in use, waiting...');
+      _logger.warning('All connections in use, adding to wait queue (${_waitingQueue.length + 1}/${_config.maxWaitingRequests})');
       return _waitForConnection();
     });
   }
@@ -255,6 +287,7 @@ class ConnectionPool {
       activeConnections: _connections.where((c) => c.inUse).length,
       idleConnections: _connections.where((c) => !c.inUse && !c.isInvalid).length,
       waitingRequests: _waitingQueue.length,
+      invalidConnections: _connections.where((c) => c.isInvalid).length,
     );
   }
 
@@ -266,10 +299,18 @@ class ConnectionPool {
       'stats': stats.toMap(),
       'invalid_connections': _connections.where((c) => c.isInvalid).length,
       'expired_connections': _connections.where((c) => !c.inUse && c.isExpired(_config.maxIdleTime)).length,
+      'timeout_statistics': {
+        'total_timeouts': _totalTimeouts,
+        'total_requests': _totalRequests,
+        'timeout_rate_percent': _totalRequests > 0 ? (_totalTimeouts / _totalRequests * 100).toStringAsFixed(2) : '0.00',
+        'last_timeout_at': _lastTimeoutAt?.toIso8601String(),
+      },
       'config': {
         'min_connections': _config.minConnections,
         'max_connections': _config.maxConnections,
         'max_wait_time': _config.maxWaitTime,
+        'max_waiting_requests': _config.maxWaitingRequests,
+        'fast_fail_enabled': _config.enableFastFail,
       },
     };
 
@@ -277,12 +318,18 @@ class ConnectionPool {
     final issues = <String>[];
     if (stats.waitingRequests > 0) {
       issues.add('有 ${stats.waitingRequests} 个请求在等待连接');
+      if (stats.waitingRequests > _config.maxWaitingRequests * 0.8) {
+        issues.add('等待队列接近饱和 (${stats.waitingRequests}/${_config.maxWaitingRequests})');
+      }
     }
     if (stats.activeConnections == _config.maxConnections) {
       issues.add('连接池已达到最大连接数 ${_config.maxConnections}');
     }
     if (_connections.where((c) => c.isInvalid).length > 0) {
       issues.add('发现 ${_connections.where((c) => c.isInvalid).length} 个无效连接');
+    }
+    if (_config.enableFastFail) {
+      issues.add('快速失败模式已启用');
     }
 
     healthInfo['issues'] = issues;
@@ -295,18 +342,27 @@ class ConnectionPool {
   int _calculateHealthScore(ConnectionPoolStats stats, int issueCount) {
     int score = 100;
     
-    // 等待请求扣分
+    // 等待请求扣分 - 根据等待队列饱和度
     if (stats.waitingRequests > 0) {
-      score -= (stats.waitingRequests * 10).clamp(0, 30);
+      final queueUtilization = stats.waitingRequests / _config.maxWaitingRequests;
+      score -= (queueUtilization * 40).round(); // 队列满时扣40分
     }
     
-    // 连接池满扣分
-    if (stats.totalConnections >= _config.maxConnections) {
-      score -= 20;
+    // 连接池使用率扣分
+    final connectionUtilization = stats.totalConnections / _config.maxConnections;
+    if (connectionUtilization >= 0.9) {
+      score -= 20; // 使用率超过90%扣20分
+    } else if (connectionUtilization >= 0.8) {
+      score -= 10; // 使用率超过80%扣10分
     }
     
     // 每个问题扣分
-    score -= issueCount * 15;
+    score -= issueCount * 10;
+    
+    // 如果启用快速失败且连接池满，额外扣分
+    if (_config.enableFastFail && connectionUtilization >= 1.0) {
+      score -= 30;
+    }
     
     return score.clamp(0, 100);
   }
@@ -366,12 +422,23 @@ class ConnectionPool {
     // 设置超时
     Timer(Duration(milliseconds: _config.maxWaitTime), () {
       if (!completer.isCompleted) {
+        // 统计超时
+        _totalTimeouts++;
+        _lastTimeoutAt = DateTime.now();
+        
+        // 在移除之前获取统计信息，这样能显示真实的等待队列长度
+        final statsBeforeRemoval = getStats();
         _waitingQueue.remove(completer);
+        
         _logger.warning('Connection request timed out after ${_config.maxWaitTime}ms, '
-                       'pool stats: ${getStats()}');
+                       'pool stats before timeout: $statsBeforeRemoval');
+        _logger.warning('Timeout statistics: ${_totalTimeouts} timeouts out of ${_totalRequests} total requests '
+                       '(${(_totalTimeouts / _totalRequests * 100).toStringAsFixed(2)}% timeout rate)');
+        
         completer.completeError(TimeoutException(
           'Timeout waiting for connection after ${_config.maxWaitTime}ms. '
-          'Pool stats: ${getStats()}',
+          'Pool stats before timeout: $statsBeforeRemoval. '
+          'Timeout rate: ${(_totalTimeouts / _totalRequests * 100).toStringAsFixed(2)}%',
           Duration(milliseconds: _config.maxWaitTime),
         ));
       }

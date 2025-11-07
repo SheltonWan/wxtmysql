@@ -1,6 +1,6 @@
 name: wxtmysql
 description: "High-performance MySQL database service with connection pooling for Flutter/Dart applications. Supports concurrent operations, transaction management, and automatic connection lifecycle management."
-version: 0.1.5
+version: 0.1.6
 homepage:
 
 environment:
