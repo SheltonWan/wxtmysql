@@ -2,8 +2,11 @@ import 'package:dotenv/dotenv.dart' as dotenv;
 import 'package:logging/logging.dart';
 import 'package:mysql1/mysql1.dart';
 import 'package:synchronized/synchronized.dart';
+import 'package:wxtmysql/pooled_connection.dart';
 
 import 'connection_pool.dart';
+import 'connection_pool_config.dart';
+import 'connection_pool_stats.dart';
 import 'database_init_config.dart';
 import 'env_keys.dart';
 
