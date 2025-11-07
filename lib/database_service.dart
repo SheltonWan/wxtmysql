@@ -263,17 +263,38 @@ class DatabaseService {
     [String? operationType]
   ) async {
     final pool = await _ensureInitialized();
-    final pooledConnection = await pool.getConnection();
+    PooledConnection? pooledConnection;
+    bool connectionAcquired = false;
     
     try {
+      pooledConnection = await pool.getConnection();
+      connectionAcquired = true;
+      
       _logger.fine('Executing ${operationType ?? 'operation'}');
       final result = await operation(pooledConnection.connection);
       return result;
     } catch (e) {
       _logger.severe('${operationType ?? 'Operation'} failed: $e');
+      
+      // 如果是连接相关的错误，标记连接为无效
+      if (e.toString().contains('MySQL server has gone away') ||
+          e.toString().contains('Lost connection to MySQL server') ||
+          e.toString().contains('Connection reset by peer')) {
+        if (pooledConnection != null) {
+          await _markConnectionAsInvalid(pooledConnection);
+          _logger.warning('Connection marked as invalid due to connection error');
+        }
+      }
+      
       rethrow;
     } finally {
-      await pool.returnConnection(pooledConnection);
+      if (connectionAcquired && pooledConnection != null) {
+        try {
+          await pool.returnConnection(pooledConnection);
+        } catch (returnError) {
+          _logger.severe('Failed to return connection to pool: $returnError');
+        }
+      }
     }
   }
 
@@ -315,41 +336,73 @@ class DatabaseService {
   /// 执行事务 - 新的连接级别事务支持
   Future<T> transaction<T>(Future<T> Function(DatabaseTransaction) operation) async {
     final pool = await _ensureInitialized();
-    final pooledConnection = await pool.getConnection();
-    
-    // 标记连接为事务状态
-    await _transactionMapLock.synchronized(() async {
-      _connectionTransactions[pooledConnection] = true;
-    });
-    
-    final transaction = DatabaseTransaction._(pooledConnection);
+    PooledConnection? pooledConnection;
+    bool connectionAcquired = false;
     
     try {
-      await pooledConnection.connection.query('START TRANSACTION');
-      _logger.fine('Transaction started on connection');
+      pooledConnection = await pool.getConnection();
+      connectionAcquired = true;
       
-      final result = await operation(transaction);
+      // 标记连接为事务状态
+      await _transactionMapLock.synchronized(() async {
+        _connectionTransactions[pooledConnection!] = true;
+      });
       
-      await pooledConnection.connection.query('COMMIT');
-      _logger.fine('Transaction committed');
+      final transaction = DatabaseTransaction._(pooledConnection);
+      bool transactionStarted = false;
       
-      return result;
-    } catch (e) {
-      _logger.warning('Transaction failed, rolling back: $e');
       try {
-        await pooledConnection.connection.query('ROLLBACK');
-        _logger.fine('Transaction rolled back');
-      } catch (rollbackError) {
-        _logger.severe('Failed to rollback transaction: $rollbackError');
+        await pooledConnection.connection.query('START TRANSACTION');
+        transactionStarted = true;
+        _logger.fine('Transaction started on connection');
+        
+        final result = await operation(transaction);
+        
+        await pooledConnection.connection.query('COMMIT');
+        _logger.fine('Transaction committed');
+        
+        return result;
+      } catch (e) {
+        _logger.warning('Transaction failed, rolling back: $e');
+        
+        if (transactionStarted) {
+          try {
+            await pooledConnection.connection.query('ROLLBACK');
+            _logger.fine('Transaction rolled back successfully');
+          } catch (rollbackError) {
+            _logger.severe('Failed to rollback transaction: $rollbackError');
+            // 如果回滚失败，标记连接为不可用，需要重新创建
+            await _markConnectionAsInvalid(pooledConnection);
+            throw Exception('Transaction rollback failed: $rollbackError. Original error: $e');
+          }
+        }
+        rethrow;
       }
+    } catch (e) {
+      _logger.severe('Transaction operation failed: $e');
       rethrow;
     } finally {
-      // 清除事务状态并归还连接
-      await _transactionMapLock.synchronized(() async {
-        _connectionTransactions.remove(pooledConnection);
-      });
-      pooledConnection.inTransaction = false;
-      await pool.returnConnection(pooledConnection);
+      if (connectionAcquired && pooledConnection != null) {
+        // 清除事务状态并归还连接
+        await _transactionMapLock.synchronized(() async {
+          _connectionTransactions.remove(pooledConnection);
+        });
+        pooledConnection.inTransaction = false;
+        
+        try {
+          await pool.returnConnection(pooledConnection);
+        } catch (returnError) {
+          _logger.severe('Failed to return connection to pool: $returnError');
+        }
+      }
+    }
+  }
+  
+  /// 标记连接为无效（内部方法）
+  Future<void> _markConnectionAsInvalid(PooledConnection pooledConnection) async {
+    if (_connectionPool != null) {
+      await _connectionPool!.markConnectionInvalid(pooledConnection);
+      _logger.warning('Connection marked as invalid due to transaction failure');
     }
   }
   
@@ -421,6 +474,44 @@ class DatabaseService {
       'host': '$_host:$_port',
       'active_transactions': _connectionTransactions.length,
     };
+  }
+
+  /// 健康检查
+  Future<Map<String, dynamic>> healthCheck() async {
+    final healthInfo = <String, dynamic>{
+      'service_status': isInitialized ? 'initialized' : 'not_initialized',
+      'database_info': {
+        'name': _database,
+        'host': '$_host:$_port',
+      },
+      'active_transactions': _connectionTransactions.length,
+    };
+
+    if (isInitialized && _connectionPool != null) {
+      try {
+        // 获取连接池健康信息
+        final poolHealth = await _connectionPool!.healthCheck();
+        healthInfo['pool_health'] = poolHealth;
+
+        // 测试数据库连接
+        final connectionTest = await testConnection();
+        healthInfo['connection_test'] = connectionTest ? 'passed' : 'failed';
+
+        // 计算整体健康评分
+        final poolScore = poolHealth['health_score'] as int;
+        final connectionPenalty = connectionTest ? 0 : 50;
+        healthInfo['overall_health_score'] = (poolScore - connectionPenalty).clamp(0, 100);
+
+      } catch (e) {
+        healthInfo['pool_health'] = {'error': e.toString()};
+        healthInfo['connection_test'] = 'error';
+        healthInfo['overall_health_score'] = 0;
+      }
+    } else {
+      healthInfo['overall_health_score'] = 0;
+    }
+
+    return healthInfo;
   }
 
   /// 检查数据库是否存在

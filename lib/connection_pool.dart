@@ -71,12 +71,14 @@ class PooledConnection {
   DateTime? lastValidatedAt;
   bool inUse;
   bool inTransaction;
+  bool isInvalid; // 新增：标记连接是否无效
 
   PooledConnection(this.connection)
       : createdAt = DateTime.now(),
         lastUsedAt = DateTime.now(),
         inUse = false,
-        inTransaction = false;
+        inTransaction = false,
+        isInvalid = false; // 初始化为有效连接
 
   /// 检查连接是否过期
   bool isExpired(int maxIdleTime) {
@@ -251,9 +253,62 @@ class ConnectionPool {
     return ConnectionPoolStats(
       totalConnections: _connections.length,
       activeConnections: _connections.where((c) => c.inUse).length,
-      idleConnections: _connections.where((c) => !c.inUse).length,
+      idleConnections: _connections.where((c) => !c.inUse && !c.isInvalid).length,
       waitingRequests: _waitingQueue.length,
     );
+  }
+
+  /// 健康检查 - 检查连接池是否健康
+  Future<Map<String, dynamic>> healthCheck() async {
+    final stats = getStats();
+    final healthInfo = <String, dynamic>{
+      'pool_status': _isClosing ? 'closing' : (_initialized ? 'healthy' : 'not_initialized'),
+      'stats': stats.toMap(),
+      'invalid_connections': _connections.where((c) => c.isInvalid).length,
+      'expired_connections': _connections.where((c) => !c.inUse && c.isExpired(_config.maxIdleTime)).length,
+      'config': {
+        'min_connections': _config.minConnections,
+        'max_connections': _config.maxConnections,
+        'max_wait_time': _config.maxWaitTime,
+      },
+    };
+
+    // 检查潜在问题
+    final issues = <String>[];
+    if (stats.waitingRequests > 0) {
+      issues.add('有 ${stats.waitingRequests} 个请求在等待连接');
+    }
+    if (stats.activeConnections == _config.maxConnections) {
+      issues.add('连接池已达到最大连接数 ${_config.maxConnections}');
+    }
+    if (_connections.where((c) => c.isInvalid).length > 0) {
+      issues.add('发现 ${_connections.where((c) => c.isInvalid).length} 个无效连接');
+    }
+
+    healthInfo['issues'] = issues;
+    healthInfo['health_score'] = _calculateHealthScore(stats, issues.length);
+
+    return healthInfo;
+  }
+
+  /// 计算健康评分 (0-100)
+  int _calculateHealthScore(ConnectionPoolStats stats, int issueCount) {
+    int score = 100;
+    
+    // 等待请求扣分
+    if (stats.waitingRequests > 0) {
+      score -= (stats.waitingRequests * 10).clamp(0, 30);
+    }
+    
+    // 连接池满扣分
+    if (stats.totalConnections >= _config.maxConnections) {
+      score -= 20;
+    }
+    
+    // 每个问题扣分
+    score -= issueCount * 15;
+    
+    return score.clamp(0, 100);
   }
 
   /// 关闭连接池
@@ -294,7 +349,9 @@ class ConnectionPool {
   /// 查找空闲连接
   PooledConnection? _findIdleConnection() {
     for (final pooledConn in _connections) {
-      if (!pooledConn.inUse && !pooledConn.isExpired(_config.maxIdleTime)) {
+      if (!pooledConn.inUse && 
+          !pooledConn.isInvalid && 
+          !pooledConn.isExpired(_config.maxIdleTime)) {
         return pooledConn;
       }
     }
@@ -310,14 +367,23 @@ class ConnectionPool {
     Timer(Duration(milliseconds: _config.maxWaitTime), () {
       if (!completer.isCompleted) {
         _waitingQueue.remove(completer);
+        _logger.warning('Connection request timed out after ${_config.maxWaitTime}ms, '
+                       'pool stats: ${getStats()}');
         completer.completeError(TimeoutException(
-          'Timeout waiting for connection',
+          'Timeout waiting for connection after ${_config.maxWaitTime}ms. '
+          'Pool stats: ${getStats()}',
           Duration(milliseconds: _config.maxWaitTime),
         ));
       }
     });
 
-    return completer.future;
+    try {
+      return await completer.future;
+    } catch (e) {
+      // 确保从等待队列中移除（防止重复移除）
+      _waitingQueue.remove(completer);
+      rethrow;
+    }
   }
 
   /// 启动维护定时器
@@ -341,6 +407,13 @@ class ConnectionPool {
       for (final pooledConn in _connections) {
         if (pooledConn.inUse) continue;
 
+        // 移除无效连接
+        if (pooledConn.isInvalid) {
+          toRemove.add(pooledConn);
+          _logger.fine('Removing invalid connection');
+          continue;
+        }
+
         // 移除过期连接
         if (pooledConn.isExpired(_config.maxIdleTime)) {
           toRemove.add(pooledConn);
@@ -353,8 +426,9 @@ class ConnectionPool {
           if (await _validateConnection(pooledConn)) {
             pooledConn.markValidated();
           } else {
+            pooledConn.isInvalid = true;
             toRemove.add(pooledConn);
-            _logger.fine('Removing invalid connection');
+            _logger.fine('Removing failed validation connection');
           }
         }
       }
@@ -382,6 +456,16 @@ class ConnectionPool {
       }
 
       _logger.info('Maintenance completed: ${getStats()}');
+    });
+  }
+
+  /// 标记连接为无效
+  Future<void> markConnectionInvalid(PooledConnection pooledConnection) async {
+    await _poolLock.synchronized(() async {
+      if (_connections.contains(pooledConnection)) {
+        pooledConnection.isInvalid = true;
+        _logger.warning('Connection marked as invalid');
+      }
     });
   }
 
