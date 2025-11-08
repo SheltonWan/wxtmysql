@@ -231,7 +231,7 @@ class SemaphoreConnectionPool implements IConnectionPool {
   @override
   Future<Map<String, dynamic>> healthCheck() async {
     final stats = getStats();
-    return {
+    final healthInfo = {
       'pool_status': _isClosing ? 'closing' : (_initialized ? 'healthy' : 'not_initialized'),
       'stats': stats.toMap(),
       'semaphore_permits_available': _connectionSemaphore.availablePermits,
@@ -244,6 +244,54 @@ class SemaphoreConnectionPool implements IConnectionPool {
         'last_timeout_at': _lastTimeoutAt?.toIso8601String(),
       },
     };
+
+    // 计算健康评分
+    healthInfo['health_score'] = _calculateHealthScore(stats);
+    
+    return healthInfo;
+  }
+
+  /// 计算健康评分 (0-100)
+  int _calculateHealthScore(ConnectionPoolStats stats) {
+    int score = 100;
+
+    // 等待请求扣分
+    if (stats.waitingRequests > 0) {
+      final queueUtilization = stats.waitingRequests / _config.maxWaitingRequests;
+      score -= (queueUtilization * 30).round(); // 队列满时扣30分
+    }
+
+    // 连接池使用率扣分
+    final connectionUtilization = stats.totalConnections / _config.maxConnections;
+    if (connectionUtilization >= 0.9) {
+      score -= 15; // 使用率超过90%扣15分
+    } else if (connectionUtilization >= 0.8) {
+      score -= 8; // 使用率超过80%扣8分
+    }
+
+    // 超时率扣分
+    if (_totalRequests > 0) {
+      final timeoutRate = _totalTimeouts / _totalRequests;
+      if (timeoutRate > 0.1) {
+        score -= 25; // 超时率超过10%扣25分
+      } else if (timeoutRate > 0.05) {
+        score -= 10; // 超时率超过5%扣10分
+      }
+    }
+
+    // 无效连接扣分
+    if (stats.invalidConnections > 0) {
+      score -= stats.invalidConnections * 5; // 每个无效连接扣5分
+    }
+
+    // 连接池状态扣分
+    if (_isClosing) {
+      score -= 50; // 关闭中扣50分
+    } else if (!_initialized) {
+      score -= 100; // 未初始化扣100分
+    }
+
+    return score.clamp(0, 100);
   }
 
   /// 关闭连接池
