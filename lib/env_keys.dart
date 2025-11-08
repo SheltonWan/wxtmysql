@@ -8,6 +8,7 @@ class EnvKeys {
   static const String dbName = 'MYSQL_DBNAME';
   static const String dbUser = 'MYSQL_USER';
   static const String dbPassword = 'MYSQL_PASSWORD';
+  static const String dbExpectedConcurrency = 'MYSQL_EXPECTED_CONCURRENCY';
 
   // 统一连接 URL（测试用）
   static const String databaseUrl = 'DATABASE_URL';

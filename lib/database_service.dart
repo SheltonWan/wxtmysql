@@ -145,6 +145,7 @@ class DatabaseService {
   late final String _database;
   late final String _username;
   late final String _password;
+  late final int _expectedConcurrency;
 
   /// 获取连接池实例（仅用于高级操作）
   IConnectionPool? get connectionPool => _connectionPool;
@@ -267,6 +268,7 @@ class DatabaseService {
     _database = env[EnvKeys.dbName] ?? 'auth_db';
     _username = env[EnvKeys.dbUser] ?? 'db_user';
     _password = env[EnvKeys.dbPassword] ?? 'db_password';
+    _expectedConcurrency = int.tryParse(env[EnvKeys.dbExpectedConcurrency] ?? '10') ?? 10;
 
     _logger.info('Database config: $_host:$_port/$_database');
   }
@@ -332,12 +334,11 @@ class DatabaseService {
       _logger.info('Creating ${_poolType!.name} connection pool');
     } else {
       // 默认使用传统连接池
-      _connectionPool = ConnectionPoolFactory.create(
-        type: ConnectionPoolType.queueLock,
+      _connectionPool = ConnectionPoolFactory.createOptimal(
         settings: settings,
-        config: poolConfig,
+        expectedConcurrency: _expectedConcurrency,
       );
-      _logger.info('Creating default queue-lock connection pool');
+      _logger.info('Creating ${_connectionPool!.typeName} connection pool');
     }
 
     await _connectionPool!.initialize();
@@ -621,6 +622,8 @@ class DatabaseService {
         'host': '$_host:$_port',
       },
       'active_transactions': _connectionTransactions.length,
+      'pool_type': currentPoolType?.name ?? 'unknown',
+      'pool_description': currentPoolDescription ?? 'unknown',
     };
 
     if (isInitialized && _connectionPool != null) {
@@ -630,23 +633,131 @@ class DatabaseService {
         healthInfo['pool_health'] = poolHealth;
 
         // 测试数据库连接
-        final connectionTest = await testConnection();
-        healthInfo['connection_test'] = connectionTest ? 'passed' : 'failed';
+        bool connectionTest = false;
+        String connectionTestError = '';
+        try {
+          connectionTest = await testConnection();
+        } catch (e) {
+          connectionTestError = e.toString();
+          _logger.warning('Health check connection test failed: $e');
+        }
 
-        // 计算整体健康评分
-        final poolScore = poolHealth['health_score'] as int;
+        healthInfo['connection_test'] = connectionTest ? 'passed' : 'failed';
+        if (!connectionTest && connectionTestError.isNotEmpty) {
+          healthInfo['connection_test_error'] = connectionTestError;
+        }
+
+        // 计算整体健康评分 - 安全获取健康评分
+        final poolScore = (poolHealth['health_score'] as int?) ?? 0;
         final connectionPenalty = connectionTest ? 0 : 50;
-        healthInfo['overall_health_score'] = (poolScore - connectionPenalty).clamp(0, 100);
+        final overallScore = (poolScore - connectionPenalty).clamp(0, 100);
+        
+        healthInfo['overall_health_score'] = overallScore;
+        
+        // 添加健康状态描述
+        healthInfo['health_status'] = _getHealthStatus(overallScore);
+        
+        // 添加建议
+        healthInfo['recommendations'] = _getHealthRecommendations(
+          poolHealth, 
+          connectionTest, 
+          overallScore,
+        );
+        
       } catch (e) {
+        _logger.severe('Health check failed: $e');
         healthInfo['pool_health'] = {'error': e.toString()};
         healthInfo['connection_test'] = 'error';
         healthInfo['overall_health_score'] = 0;
+        healthInfo['health_status'] = 'critical';
+        healthInfo['recommendations'] = ['检查连接池配置和数据库连接'];
       }
     } else {
       healthInfo['overall_health_score'] = 0;
+      healthInfo['health_status'] = 'not_ready';
+      healthInfo['recommendations'] = ['初始化数据库服务'];
     }
 
     return healthInfo;
+  }
+
+  /// 根据健康评分获取状态描述
+  String _getHealthStatus(int score) {
+    if (score >= 90) return 'excellent';
+    if (score >= 75) return 'good';
+    if (score >= 50) return 'fair';
+    if (score >= 25) return 'poor';
+    return 'critical';
+  }
+
+  /// 获取健康检查建议
+  List<String> _getHealthRecommendations(
+    Map<String, dynamic> poolHealth,
+    bool connectionTest,
+    int overallScore,
+  ) {
+    final recommendations = <String>[];
+
+    // 连接测试失败
+    if (!connectionTest) {
+      recommendations.add('数据库连接失败，检查网络和数据库服务状态');
+    }
+
+    // 连接池相关建议
+    final stats = poolHealth['stats'] as Map<String, dynamic>?;
+    if (stats != null) {
+      final waitingRequests = stats['waitingRequests'] as int? ?? 0;
+      final totalConnections = stats['totalConnections'] as int? ?? 0;
+      final activeConnections = stats['activeConnections'] as int? ?? 0;
+      final invalidConnections = stats['invalidConnections'] as int? ?? 0;
+
+      if (waitingRequests > 0) {
+        recommendations.add('有 $waitingRequests 个请求在等待连接，考虑增加最大连接数');
+      }
+
+      if (totalConnections > 0) {
+        final utilizationRate = (activeConnections / totalConnections * 100).round();
+        if (utilizationRate > 90) {
+          recommendations.add('连接池使用率过高 ($utilizationRate%)，考虑扩容');
+        }
+      }
+
+      if (invalidConnections > 0) {
+        recommendations.add('发现 $invalidConnections 个无效连接，检查数据库稳定性');
+      }
+    }
+
+    // 超时统计相关建议
+    final timeoutStats = poolHealth['timeout_statistics'] as Map<String, dynamic>?;
+    if (timeoutStats != null) {
+      final timeoutRate = timeoutStats['timeout_rate_percent'] as String?;
+      if (timeoutRate != null) {
+        final rate = double.tryParse(timeoutRate) ?? 0.0;
+        if (rate > 10.0) {
+          recommendations.add('超时率过高 ($timeoutRate%)，检查网络延迟和查询性能');
+        } else if (rate > 5.0) {
+          recommendations.add('超时率较高 ($timeoutRate%)，建议优化查询或增加超时时间');
+        }
+      }
+    }
+
+    // 整体评分建议
+    if (overallScore < 50) {
+      recommendations.add('系统健康状况不佳，建议进行全面检查和优化');
+    } else if (overallScore < 75) {
+      recommendations.add('系统运行正常但有优化空间');
+    }
+
+    // 如果没有具体建议，给出通用建议
+    if (recommendations.isEmpty) {
+      if (overallScore >= 90) {
+        recommendations.add('系统运行良好，保持当前配置');
+      } else {
+        recommendations.add('定期监控系统状态');
+      }
+    }
+
+    return recommendations;
   }
 
   /// 检查数据库是否存在
