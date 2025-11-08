@@ -8,6 +8,7 @@ export 'connection_pool_config.dart' show ConnectionPoolConfig;
 export 'semaphore_connection_pool.dart' show SemaphoreConnectionPool;
 export 'pooled_connection.dart' show PooledConnection;
 export 'connection_pool_stats.dart' show ConnectionPoolStats;
+export 'abstract/i_connection_pool.dart' show IConnectionPool, ConnectionPoolType;
 export 'env_keys.dart' show EnvKeys;
 
 // 重新导出mysql1包的常用类型以便使用
