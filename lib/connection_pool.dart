@@ -6,11 +6,12 @@ import 'package:mysql1/mysql1.dart';
 import 'package:synchronized/synchronized.dart';
 import 'package:wxtmysql/pooled_connection.dart';
 
+import 'abstract/i_connection_pool.dart';
 import 'connection_pool_config.dart';
 import 'connection_pool_stats.dart';
 
-/// 高性能连接池实现
-class ConnectionPool {
+/// 高性能连接池实现 - 传统队列+锁实现
+class ConnectionPool implements IConnectionPool {
   final ConnectionSettings _settings;
   final ConnectionPoolConfig _config;
   final Logger _logger = Logger('ConnectionPool');
@@ -28,11 +29,33 @@ class ConnectionPool {
   int _totalRequests = 0;
   DateTime? _lastTimeoutAt;
 
+  @override
+  ConnectionPoolType get type => ConnectionPoolType.queueLock;
+
+  @override
+  ConnectionPoolConfig get config => _config;
+
+  @override
+  ConnectionSettings get settings => _settings;
+
+  @override
+  bool get isInitialized => _initialized;
+
+  @override
+  bool get isClosing => _isClosing;
+
+  @override
+  String get typeName => type.toString().split('.').last;
+
+  @override
+  String get description => '传统队列+锁实现 - 稳定可靠，适合低并发场景';
+
   ConnectionPool(this._settings, [ConnectionPoolConfig? config]) : _config = config ?? const ConnectionPoolConfig() {
     _config.validate();
   }
 
   /// 初始化连接池
+  @override
   Future<void> initialize() async {
     if (_initialized) return;
 
@@ -63,6 +86,7 @@ class ConnectionPool {
   }
 
   /// 获取连接
+  @override
   Future<PooledConnection> getConnection() async {
     _totalRequests++; // 统计总请求数
 
@@ -145,6 +169,7 @@ class ConnectionPool {
   }
 
   /// 归还连接
+  @override
   Future<void> returnConnection(PooledConnection pooledConnection) async {
     Completer<PooledConnection>? waiter;
 
@@ -169,6 +194,7 @@ class ConnectionPool {
   }
 
   /// 获取连接池统计信息（线程安全版本）
+  @override
   ConnectionPoolStats getStats() {
     // 为了避免在锁内调用时的潜在问题，这里创建快照
     final connectionsCopy = List<PooledConnection>.from(_connections);
@@ -184,6 +210,7 @@ class ConnectionPool {
   }
 
   /// 健康检查 - 检查连接池是否健康
+  @override
   Future<Map<String, dynamic>> healthCheck() async {
     final stats = getStats();
     final healthInfo = <String, dynamic>{
@@ -261,6 +288,7 @@ class ConnectionPool {
   }
 
   /// 关闭连接池
+  @override
   Future<void> close() async {
     _isClosing = true;
     _maintenanceTimer?.cancel();
@@ -439,6 +467,7 @@ class ConnectionPool {
   }
 
   /// 标记连接为无效
+  @override
   Future<void> markConnectionInvalid(PooledConnection pooledConnection) async {
     await _poolLock.synchronized(() async {
       if (_connections.contains(pooledConnection)) {

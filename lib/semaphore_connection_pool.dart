@@ -6,11 +6,12 @@ import 'package:mysql1/mysql1.dart';
 import 'package:synchronized/synchronized.dart';
 import 'package:wxtmysql/pooled_connection.dart';
 
+import 'abstract/i_connection_pool.dart';
 import 'connection_pool_config.dart';
 import 'connection_pool_stats.dart';
 
 /// 使用信号量的连接池实现
-class SemaphoreConnectionPool {
+class SemaphoreConnectionPool implements IConnectionPool {
   final ConnectionSettings _settings;
   final ConnectionPoolConfig _config;
   final Logger _logger = Logger('SemaphoreConnectionPool');
@@ -34,6 +35,27 @@ class SemaphoreConnectionPool {
   int _totalTimeouts = 0;
   DateTime? _lastTimeoutAt;
 
+  @override
+  ConnectionPoolType get type => ConnectionPoolType.semaphore;
+
+  @override
+  ConnectionPoolConfig get config => _config;
+
+  @override
+  ConnectionSettings get settings => _settings;
+
+  @override
+  bool get isInitialized => _initialized;
+
+  @override
+  bool get isClosing => _isClosing;
+
+  @override
+  String get typeName => type.toString().split('.').last;
+
+  @override
+  String get description => '信号量实现 - 高并发优化，适合高负载场景';
+
   SemaphoreConnectionPool(this._settings, [ConnectionPoolConfig? config])
       : _config = config ?? const ConnectionPoolConfig() {
     _config.validate();
@@ -41,6 +63,7 @@ class SemaphoreConnectionPool {
   }
 
   /// 初始化连接池
+  @override
   Future<void> initialize() async {
     if (_initialized) return;
 
@@ -75,6 +98,7 @@ class SemaphoreConnectionPool {
   }
 
   /// 获取连接 - 使用信号量控制并发
+  @override
   Future<PooledConnection> getConnection() async {
     _totalRequests++;
 
@@ -143,6 +167,7 @@ class SemaphoreConnectionPool {
   }
 
   /// 归还连接
+  @override
   Future<void> returnConnection(PooledConnection pooledConnection) async {
     await _poolLock.synchronized(() async {
       if (_allConnections.contains(pooledConnection)) {
@@ -179,6 +204,7 @@ class SemaphoreConnectionPool {
   }
 
   /// 标记连接为无效
+  @override
   Future<void> markConnectionInvalid(PooledConnection pooledConnection) async {
     await _poolLock.synchronized(() async {
       if (_allConnections.contains(pooledConnection)) {
@@ -189,6 +215,7 @@ class SemaphoreConnectionPool {
   }
 
   /// 获取连接池统计信息
+  @override
   ConnectionPoolStats getStats() {
     final allConnectionsList = _allConnections.toList();
     return ConnectionPoolStats(
@@ -201,6 +228,7 @@ class SemaphoreConnectionPool {
   }
 
   /// 健康检查
+  @override
   Future<Map<String, dynamic>> healthCheck() async {
     final stats = getStats();
     return {
@@ -219,6 +247,7 @@ class SemaphoreConnectionPool {
   }
 
   /// 关闭连接池
+  @override
   Future<void> close() async {
     _isClosing = true;
     _maintenanceTimer?.cancel();

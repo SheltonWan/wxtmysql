@@ -4,8 +4,9 @@ import 'package:mysql1/mysql1.dart';
 import 'package:synchronized/synchronized.dart';
 import 'package:wxtmysql/pooled_connection.dart';
 
-import 'connection_pool.dart';
+import 'abstract/i_connection_pool.dart';
 import 'connection_pool_config.dart';
+import 'connection_pool_factory.dart';
 import 'connection_pool_stats.dart';
 import 'database_init_config.dart';
 import 'env_keys.dart';
@@ -59,11 +60,25 @@ class DatabaseTransaction {
   }
 }
 
-/// MySQL数据库连接服务 - 支持高并发连接池
+/// MySQL数据库连接服务 - 支持策略模式的连接池切换
 class DatabaseService {
   /// 私有构造函数
   DatabaseService._() {
     _initializeConfig();
+  }
+
+  /// 使用自定义连接池的工厂构造函数 - 支持依赖注入
+  /// [connectionPool] 注入的连接池实例
+  factory DatabaseService.withConnectionPool(IConnectionPool connectionPool) {
+    if (_instance != null) {
+      throw StateError(
+          'DatabaseService instance already exists. Use DatabaseService.instance instead, or call DatabaseService.reset() first.');
+    }
+    final service = DatabaseService._();
+    service._connectionPool = connectionPool;
+    service._isExternalPool = true; // 标记为外部注入的连接池
+    _instance = service;
+    return service;
   }
 
   /// 工厂构造函数，支持自定义连接池配置
@@ -76,6 +91,24 @@ class DatabaseService {
     final service = DatabaseService._();
     service._poolConfig = config;
     _instance = service; // 确保设置实例
+    return service;
+  }
+
+  /// 使用连接池类型的工厂构造函数
+  /// [poolType] 连接池类型
+  /// [config] 连接池配置（可选）
+  factory DatabaseService.withPoolType({
+    required ConnectionPoolType poolType,
+    ConnectionPoolConfig? config,
+  }) {
+    if (_instance != null) {
+      throw StateError(
+          'DatabaseService instance already exists. Use DatabaseService.instance instead, or call DatabaseService.reset() first.');
+    }
+    final service = DatabaseService._();
+    service._poolType = poolType;
+    service._poolConfig = config;
+    _instance = service;
     return service;
   }
 
@@ -93,9 +126,14 @@ class DatabaseService {
 
   final Logger _logger = Logger('DatabaseService');
 
-  // 连接池相关
-  ConnectionPool? _connectionPool;
+  // 连接池相关 - 支持策略模式
+  IConnectionPool? _connectionPool;
   ConnectionPoolConfig? _poolConfig;
+  ConnectionPoolType? _poolType;
+  bool _isExternalPool = false; // 标记是否为外部注入的连接池
+
+  /// 获取当前设置的连接池类型（在初始化前）
+  ConnectionPoolType? get configuredPoolType => _poolType;
 
   // 事务管理 - 现在使用连接级别的事务
   final Map<PooledConnection, bool> _connectionTransactions = {};
@@ -109,7 +147,13 @@ class DatabaseService {
   late final String _password;
 
   /// 获取连接池实例（仅用于高级操作）
-  ConnectionPool? get connectionPool => _connectionPool;
+  IConnectionPool? get connectionPool => _connectionPool;
+
+  /// 获取当前连接池类型
+  ConnectionPoolType? get currentPoolType => _connectionPool?.type;
+
+  /// 获取当前连接池描述
+  String? get currentPoolDescription => _connectionPool?.description;
 
   String get databaseName => _database;
 
@@ -118,6 +162,95 @@ class DatabaseService {
 
   /// 获取连接池统计信息
   ConnectionPoolStats? get poolStats => _connectionPool?.getStats();
+
+  /// 动态切换连接池实现
+  /// 警告：此操作会关闭当前连接池并创建新的连接池
+  /// [newPoolType] 新的连接池类型
+  /// [newConfig] 新的连接池配置（可选，如果不提供则使用当前配置）
+  Future<void> switchConnectionPool({
+    required ConnectionPoolType newPoolType,
+    ConnectionPoolConfig? newConfig,
+  }) async {
+    if (_isExternalPool) {
+      throw StateError('Cannot switch externally injected connection pool');
+    }
+
+    _logger.info('Switching connection pool from ${currentPoolType} to $newPoolType');
+
+    // 关闭当前连接池
+    if (_connectionPool != null) {
+      await _connectionPool!.close();
+    }
+
+    // 创建新的连接池
+    final settings = ConnectionSettings(
+      host: _host,
+      port: _port,
+      user: _username,
+      password: _password,
+      db: _database,
+    );
+
+    final config = newConfig ?? _poolConfig ?? const ConnectionPoolConfig();
+    _connectionPool = ConnectionPoolFactory.create(
+      type: newPoolType,
+      settings: settings,
+      config: config,
+    );
+
+    _poolType = newPoolType;
+    if (newConfig != null) {
+      _poolConfig = newConfig;
+    }
+
+    // 初始化新连接池
+    await _connectionPool!.initialize();
+
+    _logger.info('Successfully switched to ${_connectionPool!.typeName} connection pool');
+  }
+
+  /// 注入新的连接池实例
+  /// [newConnectionPool] 新的连接池实例
+  Future<void> injectConnectionPool(IConnectionPool newConnectionPool) async {
+    _logger.info('Injecting new connection pool: ${newConnectionPool.typeName}');
+
+    // 关闭当前连接池（如果不是外部注入的）
+    if (_connectionPool != null && !_isExternalPool) {
+      await _connectionPool!.close();
+    }
+
+    _connectionPool = newConnectionPool;
+    _isExternalPool = true;
+
+    // 确保新连接池已初始化
+    if (!newConnectionPool.isInitialized) {
+      await newConnectionPool.initialize();
+    }
+
+    _logger.info('Successfully injected ${newConnectionPool.typeName} connection pool');
+  }
+
+  /// 获取连接池性能对比信息
+  Map<String, dynamic> getConnectionPoolInfo() {
+    if (_connectionPool == null) {
+      return {'status': 'not_initialized'};
+    }
+
+    return {
+      'current_type': _connectionPool!.typeName,
+      'description': _connectionPool!.description,
+      'is_external': _isExternalPool,
+      'is_initialized': _connectionPool!.isInitialized,
+      'is_closing': _connectionPool!.isClosing,
+      'stats': _connectionPool!.getStats().toMap(),
+      'config': {
+        'min_connections': _connectionPool!.config.minConnections,
+        'max_connections': _connectionPool!.config.maxConnections,
+        'max_wait_time': _connectionPool!.config.maxWaitTime,
+        'enable_fast_fail': _connectionPool!.config.enableFastFail,
+      },
+    };
+  }
 
   /// 检查是否有活跃连接
   bool get hasActiveConnections {
@@ -165,6 +298,15 @@ class DatabaseService {
       _logger.info('Initializing DatabaseService with config: $config');
     }
 
+    // 如果已经有外部注入的连接池，直接使用
+    if (_isExternalPool && _connectionPool != null) {
+      if (!_connectionPool!.isInitialized) {
+        await _connectionPool!.initialize();
+      }
+      _logger.info('Using externally injected ${_connectionPool!.typeName} connection pool');
+      return;
+    }
+
     // 如果需要确保数据库存在，先检查和创建
     if (config.ensureDatabase) {
       await _ensureDatabaseExists(config.charset, config.collate);
@@ -179,21 +321,38 @@ class DatabaseService {
     );
 
     final poolConfig = _poolConfig ?? const ConnectionPoolConfig();
-    _connectionPool = ConnectionPool(settings, poolConfig);
+
+    // 根据配置的连接池类型创建连接池
+    if (_poolType != null) {
+      _connectionPool = ConnectionPoolFactory.create(
+        type: _poolType!,
+        settings: settings,
+        config: poolConfig,
+      );
+      _logger.info('Creating ${_poolType!.name} connection pool');
+    } else {
+      // 默认使用传统连接池
+      _connectionPool = ConnectionPoolFactory.create(
+        type: ConnectionPoolType.queueLock,
+        settings: settings,
+        config: poolConfig,
+      );
+      _logger.info('Creating default queue-lock connection pool');
+    }
 
     await _connectionPool!.initialize();
 
     if (config.verboseLogging) {
-      _logger.info('DatabaseService initialized successfully with connection pool');
+      _logger.info('DatabaseService initialized successfully with ${_connectionPool!.typeName} connection pool');
       final dbInfo = await getDatabaseInfo();
       _logger.info('Database info: $dbInfo');
     } else {
-      _logger.info('DatabaseService initialized with connection pool');
+      _logger.info('DatabaseService initialized with ${_connectionPool!.typeName} connection pool');
     }
   }
 
   /// 确保连接池已初始化
-  Future<ConnectionPool> _ensureInitialized() async {
+  Future<IConnectionPool> _ensureInitialized() async {
     if (_connectionPool == null) {
       await initialize();
     }
